@@ -1,4 +1,4 @@
-use super::super::{content::clean, is_rate_limited};
+use super::super::{content::clean, is_rate_limited, RegisteredKey};
 use super::*;
 use std::{collections::VecDeque, fs};
 
@@ -11,6 +11,7 @@ fn device() -> Device {
         install_id: "987654321".into(),
         device_type: "P30".into(),
         device_brand: "realme".into(),
+        cdid: Some("aabbccdd-1234-4321-8901-aabbccddeeff".into()),
     }
 }
 
@@ -181,7 +182,7 @@ impl Gateway for Fake {
         self.registrations += 1;
         Ok(device())
     }
-    fn register_key(&mut self, _: &Device) -> AppResult<(Vec<u8>, Option<Value>)> {
+    fn register_key(&mut self, _: &Device) -> AppResult<RegisteredKey> {
         panic!("search must not register a chapter key")
     }
     fn fetch(&mut self, _: &Credentials, _: &str, _: &str) -> AppResult<String> {
@@ -569,15 +570,7 @@ fn invalid_search_does_not_create_storage_and_query_is_encoded() {
         assert!(search(dir.path(), &term).is_err());
     }
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
-    let encoded = query(
-        &device(),
-        &[
-            ("query", WANTED),
-            ("passback", "a+b&c"),
-            ("selected_items", ""),
-            ("tab_type", "3"),
-        ],
-    );
+    let encoded = reader_profile::search_query(&device(), WANTED, "a+b&c", 123456).unwrap();
     let pairs: Vec<_> = url::form_urlencoded::parse(encoded.as_bytes()).collect();
     assert!(pairs
         .iter()
@@ -585,6 +578,18 @@ fn invalid_search_does_not_create_storage_and_query_is_encoded() {
     assert!(pairs
         .iter()
         .any(|(key, value)| key == "passback" && value == "a+b&c"));
+    for pair in [
+        ("version_code", "74532"),
+        ("_rticket", "123456"),
+        ("tab_type", "3"),
+    ] {
+        assert!(pairs
+            .iter()
+            .any(|(key, value)| key == pair.0 && value == pair.1));
+    }
+    assert!(!pairs
+        .iter()
+        .any(|(key, _)| matches!(key.as_ref(), "item_ids" | "key_register_ts")));
 }
 
 /// Manual: set FANQIE_APP_DATA_DIR to an existing private device directory;

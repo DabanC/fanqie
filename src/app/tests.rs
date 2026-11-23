@@ -13,7 +13,11 @@ fn failed_width_command_does_not_modify_settings() {
     assert!(app.is_error);
 }
 fn settle(app: &mut App) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    settle_with_timeout(app, std::time::Duration::from_secs(5));
+}
+
+fn settle_with_timeout(app: &mut App, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
     while app.busy.is_some() && std::time::Instant::now() < deadline {
         app.poll_results();
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -50,6 +54,53 @@ fn reading_workflow_preserves_progress_and_chapter_navigation() {
     restarted.execute("/resume");
     settle(&mut restarted);
     assert_eq!(restarted.chapter, 1);
+}
+
+#[test]
+#[ignore = "访问番茄公开目录和章节；可能在临时目录注册一个匿名 APP 设备"]
+fn live_goto_509_reads_full_chapter() {
+    check_live_goto(509, "7709158341783601688", "第509章 宣传三", 2_039);
+}
+
+#[test]
+#[ignore = "访问番茄公开目录和章节；可能在临时目录注册一个匿名 APP 设备"]
+fn live_goto_510_reads_full_chapter() {
+    check_live_goto(
+        510,
+        "7709522412122931774",
+        "第510章 到了把精力放在军事上的时候了",
+        2_082,
+    );
+}
+
+fn check_live_goto(number: usize, chapter_id: &str, title: &str, word_count: usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path().into()).unwrap();
+    let mut app = App::new(store.clone()).unwrap();
+    let timeout = std::time::Duration::from_secs(60);
+    app.execute("/open 7635637943461235736");
+    settle_with_timeout(&mut app, timeout);
+    app.execute(&format!("/goto {number}"));
+    settle_with_timeout(&mut app, timeout);
+
+    let book = app.current.as_ref().unwrap();
+    assert_eq!(book.id, "7635637943461235736");
+    assert_eq!(app.chapter, number - 1);
+    let chapter = &book.chapters[app.chapter];
+    assert_eq!(chapter.id, chapter_id);
+    assert_eq!(chapter.title, title);
+    let count = app.content.chars().filter(|c| !c.is_whitespace()).count();
+    assert!(
+        count >= word_count,
+        "官网标注 {word_count} 字，仅返回 {count} 个非空白字符"
+    );
+    assert!(!app
+        .content
+        .chars()
+        .any(|c| matches!(c as u32, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd)));
+    let cached = store.cached_chapter(&book.id, &chapter.id).unwrap();
+    assert!(cached.as_deref() == Some(&app.content), "缓存与正文不一致");
+    eprintln!("/goto {number}：{count} 个非空白字符，缓存与正文一致");
 }
 
 #[test]

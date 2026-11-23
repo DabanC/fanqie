@@ -239,28 +239,42 @@ pub(super) fn json_content(payload: &Value, id: &str) -> Result<String> {
     content(&raw, false)
 }
 
+fn reader_locked(chapter: &Value) -> bool {
+    ["isChapterLock", "needPay", "needLogin"]
+        .iter()
+        .any(|key| match chapter.get(*key) {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(Value::Number(value)) => value.as_u64() != Some(0),
+            Some(Value::String(value)) => !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "none"
+            ),
+            _ => true,
+        })
+}
+
+fn reader_word_count(chapter: &Value) -> Option<usize> {
+    let count = chapter.get("chapterWordNumber")?;
+    count
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .or_else(|| count.as_str()?.parse().ok())
+        .filter(|&n| n > 0)
+}
+
 pub(super) fn reader_content(page: &str) -> Result<String> {
     for state in page_states(page) {
         if let Some(chapter) = state.pointer("/reader/chapterData") {
-            if chapter.get("isChapterLock").and_then(Value::as_bool) == Some(true)
-                || chapter.get("needPay").and_then(Value::as_u64).unwrap_or(0) != 0
-            {
-                bail!("官网只提供本章试读片段，需要使用直连阅读通道");
+            if reader_locked(chapter) {
+                return Err(super::WebPreview.into());
             }
             if let Some(raw) = chapter.get("content").and_then(Value::as_str) {
                 let plain = html_text(raw);
                 let decoded = font::decode(page, &plain)?;
-                let expected = chapter
-                    .get("chapterWordNumber")
-                    .and_then(|value| {
-                        value
-                            .as_str()
-                            .and_then(|s| s.parse::<usize>().ok())
-                            .or_else(|| value.as_u64().map(|n| n as usize))
-                    })
-                    .unwrap_or(0);
+                let expected = reader_word_count(chapter).unwrap_or(0);
                 if expected > 0 && decoded.chars().count() < expected.saturating_mul(3) / 4 {
-                    bail!("网页正文不完整，需要使用直连阅读通道");
+                    bail!("网页正文长度不足，未返回全文");
                 }
                 return content(&decoded, true);
             }

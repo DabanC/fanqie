@@ -483,3 +483,74 @@ fn cancelled_app_search_never_starts_fallback() {
     });
     assert!(calls.lock().unwrap().is_empty());
 }
+
+#[test]
+fn chapter_error_retains_why_the_public_page_was_rejected() {
+    let state = json!({"reader":{"chapterData":{"bookId":"11","itemId":"22"}}});
+    let page = format!("<script>window.__INITIAL_STATE__={state};</script>");
+    let (remote, calls) = fake(vec![ok(&page)]);
+    let error = remote.chapter(&book(), 0).unwrap_err();
+    assert!(format!("{error:#}").contains("网页返回的书籍或章节不匹配"));
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn locked_public_chapter_rejects_preview() {
+    let state = json!({"reader":{"chapterData":{
+        "bookId":"11", "itemId":"21", "isChapterLock":true, "needPay":0,
+        "chapterWordNumber":"2039", "content":"试读正文"
+    }}});
+    let page = format!("<script>window.__INITIAL_STATE__={state};</script>");
+    let (remote, calls) = fake(vec![ok(&page)]);
+    let error = remote.chapter(&book(), 0).unwrap_err();
+    assert!(error.is::<WebPreview>());
+    let message = format!("{error:#}");
+    assert!(message.contains("只提供本章试读"));
+    assert!(!message.contains("试读正文"));
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn rate_limited_reader_does_not_switch_to_app() {
+    let (mut remote, calls) = fake(vec![Ok((429, Vec::new()))]);
+    let dir = tempfile::tempdir().unwrap();
+    // A non-directory path prevents real APP I/O even if fallback regresses.
+    let invalid_root = dir.path().join("not-a-directory");
+    std::fs::write(&invalid_root, b"").unwrap();
+    remote.data_dir = Some(invalid_root);
+    assert!(remote
+        .chapter(&book(), 0)
+        .unwrap_err()
+        .is::<WebRateLimited>());
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+#[ignore = "live public web reader only; no APP device or local user data"]
+fn live_public_reader_second_chapter() {
+    let remote = Remote::new(&Settings::default()).unwrap();
+    let chapter_id = "7635860025788858904";
+    let mut book = book();
+    book.id = "7635637943461235736".into();
+    book.chapters[0].id = chapter_id.into();
+    let text = remote.chapter(&book, 0).unwrap();
+    eprintln!(
+        "public web reader returned {} characters",
+        text.chars().count()
+    );
+    assert!(text.chars().count() >= 1_500);
+    assert!(!text
+        .chars()
+        .any(|c| matches!(c as u32, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd)));
+}
+
+#[test]
+#[ignore = "live public catalog and chapter 509; no APP device, login, or local user data"]
+fn live_public_reader_chapter_509_preview() {
+    let remote = Remote::new(&Settings::default()).unwrap();
+    let book = remote.catalog("7635637943461235736").unwrap();
+    assert_eq!(book.chapters[508].id, "7709158341783601688");
+    assert_eq!(book.chapters[508].title, "第509章 宣传三");
+    let error = remote.chapter(&book, 508).unwrap_err();
+    assert!(error.is::<WebPreview>(), "{error:#}");
+}

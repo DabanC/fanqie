@@ -198,6 +198,50 @@ fn live_reported_title_search() {
     }
 }
 
+#[test]
+#[ignore = "新版 APP 在线搜索及第 509 章正文；只在临时目录注册匿名设备"]
+fn live_current_app_search_then_read_509() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path().to_owned()).unwrap();
+    let library = Library::new(store.clone(), Settings::default()).unwrap();
+    let query = "校长写日记骂我，我在南洋当总统";
+    let report = library.search_report(query).unwrap();
+    assert!(
+        report.notice.is_none(),
+        "此用例必须直接命中主搜索，不能用降级结果代替"
+    );
+    let hit = report
+        .books
+        .iter()
+        .find(|book| book.id == "7635637943461235736")
+        .unwrap();
+    assert_eq!(hit.title, query);
+    let book = library.open_search_hit(hit).unwrap();
+    let chapter = &book.chapters[508];
+    assert_eq!(chapter.id, "7709158341783601688");
+    assert!(store
+        .cached_chapter(&book.id, &chapter.id)
+        .unwrap()
+        .is_none());
+    let text = library.chapter(&book, 508).unwrap();
+    let count = text.chars().filter(|c| !c.is_whitespace()).count();
+    assert!(count >= 2039, "只读到 {count} 个非空白字符");
+    assert!(!text.chars().any(
+        |c| matches!(c as u32, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd | 0xfffd)
+    ));
+    assert!(
+        store
+            .cached_chapter(&book.id, &chapter.id)
+            .unwrap()
+            .as_deref()
+            == Some(text.as_str())
+    );
+    println!(
+        "新版 APP 搜中 {}，在线读到第 509 章：{count} 个非空白字符",
+        book.id
+    );
+}
+
 fn cached_hit(id: &str, title: &str) -> Book {
     Book {
         id: id.into(),

@@ -1,5 +1,5 @@
 //! Bounded single-chapter remote access. No upstream error or URL is displayed.
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
@@ -36,6 +36,17 @@ impl std::fmt::Display for WebRateLimited {
 }
 
 impl std::error::Error for WebRateLimited {}
+
+#[derive(Debug)]
+struct WebPreview;
+
+impl std::fmt::Display for WebPreview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("官网只提供本章试读，未授权全文")
+    }
+}
+
+impl std::error::Error for WebPreview {}
 
 struct Response {
     status: u16,
@@ -199,38 +210,18 @@ impl Remote {
             .ok_or_else(|| anyhow!("章节序号超出目录范围"))?;
         valid_id(&chapter.id)?;
         if self.content_api.is_empty() {
-            let webpage = self.request(&format!("https://fanqienovel.com/reader/{}", chapter.id));
-            net::check()?;
-            let webpage = match webpage {
+            let web_error = match self.web_chapter(&book.id, &chapter.id) {
+                Ok(text) => return Ok(text),
                 Err(error) if error.is::<WebRateLimited>() => return Err(error),
-                other => other,
+                Err(error) => error,
             };
-            if let Ok(page) = &webpage {
-                // Never cache a teaser or text belonging to another chapter.
-                let matches = page_states(page).iter().all(|state| {
-                    state.pointer("/reader/chapterData").is_none_or(|data| {
-                        [
-                            ("bookId", book.id.as_str()),
-                            ("itemId", chapter.id.as_str()),
-                        ]
-                        .iter()
-                        .all(|(field, expected)| {
-                            data.get(*field)
-                                .is_none_or(|id| upstream_id(id).is_ok_and(|id| id == *expected))
-                        })
-                    })
-                });
-                if matches {
-                    if let Ok(text) = reader_content(page) {
-                        return Ok(text);
-                    }
-                }
-            }
+            net::check()?;
             if let Some(data_dir) = &self.data_dir {
-                let text = app_api::chapter(data_dir, &book.id, &chapter.id)?;
-                return content(&text, false);
+                return app_api::chapter(data_dir, &book.id, &chapter.id)
+                    .and_then(|text| content(&text, false))
+                    .with_context(|| format!("网页正文不可用（{web_error:#}）"));
             }
-            bail!(CONTENT_HELP);
+            return Err(web_error.context(CONTENT_HELP));
         }
         let url = api_url(
             &self.content_api,
@@ -240,6 +231,25 @@ impl Remote {
         let raw = self.request(&url)?;
         let value = serde_json::from_str::<Value>(&raw).map_err(|_| anyhow!(CONTENT_HELP))?;
         json_content(&value, &chapter.id)
+    }
+
+    fn web_chapter(&self, book_id: &str, chapter_id: &str) -> Result<String> {
+        let page = self.request(&format!("https://fanqienovel.com/reader/{chapter_id}"))?;
+        net::check()?;
+        // Reject text belonging to another chapter before attempting to decode it.
+        for state in page_states(&page) {
+            let Some(data) = state.pointer("/reader/chapterData") else {
+                continue;
+            };
+            for (field, expected) in [("bookId", book_id), ("itemId", chapter_id)] {
+                if let Some(id) = data.get(field) {
+                    if !upstream_id(id).is_ok_and(|id| id == expected) {
+                        bail!("网页返回的书籍或章节不匹配");
+                    }
+                }
+            }
+        }
+        reader_content(&page)
     }
 
     #[cfg(test)]

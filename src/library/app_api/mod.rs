@@ -1,11 +1,12 @@
 //! Anonymous official-app access for novel search and one requested chapter.
-//! Protocol constants and algorithms follow core/appapi.py (APP 7.0.1.32).
+//! Signing and registration algorithms derive from core/appapi.py.
 //! Port of Jees996/fanqie-novel-downloader core/appapi.py, MIT, copyright
 //! 2026 xian lee; upstream commit 486f2844b1c5e5e113cb4f0abf46b75e995f0c4f.
 //! License text is retained in licenses/fanqie-novel-downloader-MIT.txt.
 mod content;
 mod crypto;
 mod device;
+mod reader_profile;
 mod search;
 #[allow(unused_imports)] // Compatibility API; normal callers use the report.
 pub(super) use search::search;
@@ -32,8 +33,9 @@ use std::io::Read;
 
 use crate::net;
 
-const BASE: &str = "https://reading.snssdk.com/reading";
 const REGISTER: &str = "https://i.snssdk.com/service/2/device_register/?tt_data=a";
+const REQUEST_INTERVAL_MS: u64 = 6_000;
+const RATE_COOLDOWN_MS: u64 = 60_000;
 const SHARED_KEY: [u8; 16] = [
     172, 37, 198, 125, 221, 143, 56, 193, 179, 122, 35, 72, 130, 142, 34, 46,
 ];
@@ -73,6 +75,12 @@ impl std::fmt::Display for Fault {
 impl std::error::Error for Fault {}
 type AppResult<T> = std::result::Result<T, Fault>;
 
+struct RegisteredKey {
+    bytes: Vec<u8>,
+    version: Option<Value>,
+    registered_at: Option<i32>,
+}
+
 /// Inspect typed causes, including contextual search errors, without matching text.
 pub(super) fn is_rate_limited(error: &anyhow::Error) -> bool {
     error
@@ -85,7 +93,7 @@ trait Gateway {
         false
     }
     fn register_device(&mut self) -> AppResult<Device>;
-    fn register_key(&mut self, device: &Device) -> AppResult<(Vec<u8>, Option<Value>)>;
+    fn register_key(&mut self, device: &Device) -> AppResult<RegisteredKey>;
     fn fetch(&mut self, state: &Credentials, book: &str, chapter: &str) -> AppResult<String>;
 }
 
@@ -94,52 +102,77 @@ trait Gateway {
 /// Requests have 8-second connect / 25-second total timeouts and bounded response sizes.
 /// Only an explicit device-expired response permits one renewal; empty/rate-limited
 /// responses never renew a device. A documented `Invalid` key permits one key refresh.
+/// An empty chapter response gets at most one retry with the same device and key.
 pub(super) fn chapter(data_dir: &Path, book_id: &str, chapter_id: &str) -> Result<String> {
     valid_id(book_id)?;
     valid_id(chapter_id)?;
-    let _lock = DeviceLock::acquire(data_dir)?;
+    with_app_gateway(data_dir, |dir, gateway| {
+        read_one(dir, gateway, book_id, chapter_id)
+    })
+}
+
+fn with_app_gateway<T>(
+    data_dir: &Path,
+    run: impl FnOnce(&Path, &mut AppGateway) -> Result<T>,
+) -> Result<T> {
+    net::check()?;
+    // Keep legacy credentials untouched and respect their cooldown during migration.
+    let _legacy_lock = DeviceLock::acquire(data_dir)?;
+    if let Some(legacy) = load_cache(data_dir)? {
+        wait_for_slot(&legacy)?;
+    }
+    let reader_dir = data_dir.join(reader_profile::CACHE_DIR);
+    let _reader_lock = DeviceLock::acquire(&reader_dir)?;
     let client = Client::builder()
+        .no_proxy()
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(25))
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("com.dragon.read")
         .build()
         .map_err(|_| Fault::Network)?;
-    read_one(data_dir, &mut AppGateway(client), book_id, chapter_id)
+    run(&reader_dir, &mut AppGateway(client))
 }
 
 fn read_one<G: Gateway>(dir: &Path, gateway: &mut G, book: &str, chapter: &str) -> Result<String> {
-    let new_state = |device| Credentials {
-        schema: 1,
-        device,
-        key: None,
-        key_version: None,
-        next_request_ms: 0,
-    };
     let mut state = match load_cache(dir)? {
         Some(state) => state,
         None => {
             let device = gateway
                 .register_device()
                 .map_err(|e| anyhow!("官方 APP 匿名设备注册失败：{e}"))?;
-            let state = new_state(device);
+            let state = Credentials::new(device);
             save_cache(dir, &state)?;
             state
         }
     };
     let mut renewed = false;
     let mut refreshed = false;
+    let mut retried_empty_chapter = false;
     loop {
         let mut stage = "章节请求";
         let result = if state.key.is_none() {
+            if gateway.pace() {
+                wait_for_slot(&state)?;
+            }
             match gateway.register_key(&state.device) {
-                Ok((key, version)) => {
-                    state.key = Some(B64.encode(key));
-                    state.key_version = version;
+                Ok(key) => {
+                    state.key = Some(B64.encode(key.bytes));
+                    state.key_version = key.version;
+                    state.key_register_ts = key.registered_at;
+                    if gateway.pace() {
+                        state.next_request_ms = state
+                            .next_request_ms
+                            .max(now_ms().saturating_add(REQUEST_INTERVAL_MS));
+                    }
                     save_cache(dir, &state)?;
                     fetch_one(dir, gateway, &mut state, book, chapter)?
                 }
                 Err(error) => {
+                    if error == Fault::RateLimited {
+                        persist_rate_limit(dir, gateway, &mut state)?;
+                        return Err(error.into());
+                    }
                     stage = "正文密钥注册";
                     Err(error)
                 }
@@ -149,18 +182,26 @@ fn read_one<G: Gateway>(dir: &Path, gateway: &mut G, book: &str, chapter: &str) 
         };
         match result {
             Ok(text) => return Ok(text),
+            // A key is present only if this iteration reached the chapter request.
+            Err(Fault::EmptyResponse) if state.key.is_some() => {
+                if retried_empty_chapter {
+                    anyhow::bail!("官方 APP 两次返回空响应，已保留当前阅读位置；请稍后重试");
+                }
+                retried_empty_chapter = true;
+            }
             Err(Fault::DeviceExpired) if !renewed => {
                 renewed = true;
                 let device = gateway
                     .register_device()
                     .map_err(|e| anyhow!("官方 APP 匿名设备更新失败：{e}"))?;
-                state = new_state(device);
+                state = Credentials::new(device);
                 save_cache(dir, &state)?;
             }
             Err(Fault::KeyExpired) if !refreshed => {
                 refreshed = true;
                 state.key = None;
                 state.key_version = None;
+                state.key_register_ts = None;
                 save_cache(dir, &state)?;
             }
             Err(error) => return Err(anyhow!("官方 APP {stage}失败：{error}")),
@@ -176,6 +217,24 @@ fn now_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+fn wait_for_slot(state: &Credentials) -> Result<()> {
+    let wait = state.next_request_ms.saturating_sub(now_ms());
+    if wait > RATE_COOLDOWN_MS {
+        return Err(Fault::RateLimited.into());
+    }
+    net::wait(Duration::from_millis(wait))
+}
+
+fn persist_rate_limit<G: Gateway>(dir: &Path, gateway: &G, state: &mut Credentials) -> Result<()> {
+    if gateway.pace() {
+        state.next_request_ms = now_ms().saturating_add(RATE_COOLDOWN_MS);
+        save_cache(dir, state).map_err(|_| {
+            anyhow::Error::new(Fault::RateLimited).context("官方 APP 冷却期保存失败")
+        })?;
+    }
+    Ok(())
+}
+
 fn fetch_one<G: Gateway>(
     dir: &Path,
     gateway: &mut G,
@@ -183,19 +242,15 @@ fn fetch_one<G: Gateway>(
     book: &str,
     chapter: &str,
 ) -> Result<AppResult<String>> {
+    net::check()?;
     if gateway.pace() {
-        let wait = state.next_request_ms.saturating_sub(now_ms());
-        if wait > 60_000 {
-            return Ok(Err(Fault::RateLimited));
-        }
-        net::wait(Duration::from_millis(wait))?;
-        state.next_request_ms = now_ms().saturating_add(6_000);
+        wait_for_slot(state)?;
+        state.next_request_ms = now_ms().saturating_add(REQUEST_INTERVAL_MS);
         save_cache(dir, state)?;
     }
     let result = gateway.fetch(state, book, chapter);
-    if gateway.pace() && result == Err(Fault::RateLimited) {
-        state.next_request_ms = now_ms().saturating_add(60_000);
-        save_cache(dir, state)?;
+    if result == Err(Fault::RateLimited) {
+        persist_rate_limit(dir, gateway, state)?;
     }
     Ok(result)
 }
@@ -318,7 +373,8 @@ impl Gateway for AppGateway {
         true
     }
     fn register_device(&mut self) -> AppResult<Device> {
-        let body = registration_body();
+        let mut body = registration_body();
+        reader_profile::prepare_registration(&mut body);
         let bytes = serde_json::to_vec(&body).map_err(|_| Fault::InvalidResponse)?;
         let encrypted = crypto::tt_encrypt(&bytes).map_err(|_| Fault::InvalidContent)?;
         let payload = self.response(
@@ -345,14 +401,21 @@ impl Gateway for AppGateway {
                 .as_str()
                 .ok_or(Fault::InvalidResponse)?
                 .into(),
+            cdid: Some(
+                body["header"]["cdid"]
+                    .as_str()
+                    .ok_or(Fault::InvalidResponse)?
+                    .to_owned(),
+            ),
             device_brand: body["header"]["device_brand"]
                 .as_str()
                 .ok_or(Fault::InvalidResponse)?
                 .into(),
         })
     }
-    fn register_key(&mut self, device: &Device) -> AppResult<(Vec<u8>, Option<Value>)> {
-        let url = format!("{BASE}/crypt/registerkey?{}", query(device, &[]));
+    fn register_key(&mut self, device: &Device) -> AppResult<RegisteredKey> {
+        let params = reader_profile::key_query(device)?;
+        let url = format!("{}/crypt/registerkey?{params}", reader_profile::BASE);
         let iv: Vec<u8> = rand::thread_rng()
             .sample_iter(&Alphanumeric)
             .take(16)
@@ -368,62 +431,48 @@ impl Gateway for AppGateway {
         let body = serde_json::to_vec(&json!({"content": B64.encode(envelope)}))
             .map_err(|_| Fault::InvalidContent)?;
         let payload = self.response(self.signed(&url, Some(&body))?)?;
-        let data = payload.get("data").ok_or(Fault::InvalidResponse)?;
-        let encoded = data
-            .get("key")
-            .and_then(Value::as_str)
-            .ok_or(Fault::InvalidResponse)?;
-        let key = decrypt_envelope(encoded, &SHARED_KEY)?;
-        if !matches!(key.len(), 16 | 24 | 32) {
-            return Err(Fault::InvalidContent);
-        }
-        if !valid_key_version(data.get("keyver")) {
-            return Err(Fault::InvalidResponse);
-        }
-        Ok((key, data.get("keyver").cloned()))
+        parse_registered_key(&payload)
     }
     fn fetch(&mut self, state: &Credentials, book: &str, chapter: &str) -> AppResult<String> {
-        // Endpoint is named batch_full, but item_ids always contains exactly ONE ID.
         let url = format!(
-            "{BASE}/reader/batch_full/v?{}",
-            query(
-                &state.device,
-                &[
-                    ("item_ids", chapter),
-                    ("book_id", book),
-                    ("novel_text_type", "1"),
-                    ("req_type", "1"),
-                ]
-            )
+            "{}/reader/batch_full/v?{}",
+            reader_profile::BASE,
+            reader_profile::chapter_query(state, book, chapter, now_ms())?
         );
         let payload = self.response(self.signed(&url, None)?)?;
         parse_response(&payload, book, chapter, &state.key()?)
     }
 }
 
-fn query(device: &Device, extra: &[(&str, &str)]) -> String {
-    let mut q = url::form_urlencoded::Serializer::new(String::new());
-    q.extend_pairs([
-        ("iid", device.install_id.as_str()),
-        ("device_id", device.device_id.as_str()),
-        ("ac", "wifi"),
-        ("channel", "43536163a"),
-        ("aid", "1967"),
-        ("app_name", "novelapp"),
-        ("version_code", "70132"),
-        ("version_name", "7.0.1.32"),
-        ("device_platform", "android"),
-        ("os", "android"),
-        ("ssmix", "a"),
-        ("os_version", "10"),
-        ("device_type", device.device_type.as_str()),
-        ("device_brand", device.device_brand.as_str()),
-        ("update_version_code", "70132"),
-        ("manifest_version_code", "70132"),
-        ("pv_player", "70132"),
-    ]);
-    q.extend_pairs(extra.iter().copied());
-    q.finish()
+fn parse_registered_key(payload: &Value) -> AppResult<RegisteredKey> {
+    let data = payload.get("data").ok_or(Fault::InvalidResponse)?;
+    let encoded = data
+        .get("key")
+        .and_then(Value::as_str)
+        .ok_or(Fault::InvalidResponse)?;
+    let bytes = decrypt_envelope(encoded, &SHARED_KEY)?;
+    if !matches!(bytes.len(), 16 | 24 | 32) {
+        return Err(Fault::InvalidContent);
+    }
+    let version = data.get("keyver");
+    if !valid_key_version(version) {
+        return Err(Fault::InvalidResponse);
+    }
+    let registered_at = match data.get("key_register_ts") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .filter(|&n| n >= 0)
+                .ok_or(Fault::InvalidResponse)?,
+        ),
+    };
+    Ok(RegisteredKey {
+        bytes,
+        version: version.cloned(),
+        registered_at,
+    })
 }
 
 #[cfg(test)]

@@ -27,6 +27,8 @@ pub(super) struct Device {
     pub(super) install_id: String,
     pub(super) device_type: String,
     pub(super) device_brand: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) cdid: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,10 +37,23 @@ pub(super) struct Credentials {
     pub(super) device: Device,
     pub(super) key: Option<String>,
     pub(super) key_version: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) key_register_ts: Option<i32>,
     #[serde(default)]
     pub(super) next_request_ms: u64,
 }
 impl Credentials {
+    pub(super) fn new(device: Device) -> Self {
+        Self {
+            schema: 1,
+            device,
+            key: None,
+            key_version: None,
+            key_register_ts: None,
+            next_request_ms: 0,
+        }
+    }
+
     pub(super) fn key(&self) -> AppResult<Vec<u8>> {
         let key = B64
             .decode(self.key.as_deref().ok_or(Fault::InvalidContent)?)
@@ -200,7 +215,14 @@ pub(super) fn load_cache(dir: &Path) -> Result<Option<Credentials>> {
         || state.device.device_type.len() > 64
         || state.device.device_brand.is_empty()
         || state.device.device_brand.len() > 64
+        || state.device.cdid.as_deref().is_some_and(|id| {
+            id.len() != 36
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        })
         || !valid_key_version(state.key_version.as_ref())
+        || state.key_register_ts.is_some_and(|ts| ts < 0)
         || (state.key.is_some() && state.key().is_err())
     {
         return Err(private_error());
@@ -211,7 +233,10 @@ pub(super) fn load_cache(dir: &Path) -> Result<Option<Credentials>> {
 #[cfg(any(unix, windows))]
 fn credential_bytes(state: &Credentials) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec(state).map_err(|_| private_error())?;
-    if bytes.len() as u64 > MAX_CACHE || !valid_key_version(state.key_version.as_ref()) {
+    if bytes.len() as u64 > MAX_CACHE
+        || !valid_key_version(state.key_version.as_ref())
+        || state.key_register_ts.is_some_and(|ts| ts < 0)
+    {
         return Err(private_error());
     }
     Ok(bytes)

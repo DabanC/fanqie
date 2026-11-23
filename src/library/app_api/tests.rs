@@ -14,6 +14,7 @@ fn device() -> Device {
         install_id: "987654321".into(),
         device_type: "P30".into(),
         device_brand: "realme".into(),
+        cdid: Some("aabbccdd-1234-4321-8901-aabbccddeeff".into()),
     }
 }
 fn state() -> Credentials {
@@ -22,6 +23,7 @@ fn state() -> Credentials {
         device: device(),
         key: Some(B64.encode(KEY)),
         key_version: Some(json!(1)),
+        key_register_ts: None,
         next_request_ms: 0,
     }
 }
@@ -186,6 +188,9 @@ fn cache_version_bound_and_trusted_directory() {
     let mut invalid = state();
     invalid.key_version = Some(json!({"untrusted": "x".repeat(20_000)}));
     assert!(save_cache(dir.path(), &invalid).is_err());
+    let mut invalid = state();
+    invalid.key_register_ts = Some(-1);
+    assert!(save_cache(dir.path(), &invalid).is_err());
     assert_eq!(fs::read(dir.path().join(CACHE)).unwrap(), original);
     #[cfg(unix)]
     {
@@ -208,6 +213,37 @@ fn reference_chapter_and_registerkey_vectors() {
     }
     assert!(parse_response(&payload(RAW, 0), "123", "456", b"wrongwrongwrongwr").is_err());
     assert!(parse_response(&payload("YWJj", 0), "123", "456", KEY).is_err());
+}
+
+#[test]
+fn registered_key_timestamp_is_distinct_from_key_version() {
+    let mut payload = json!({"data": {"key": REGISTER_KEY, "keyver": 7}});
+    let old_key = parse_registered_key(&payload).unwrap();
+    assert_eq!(old_key.registered_at, None);
+    payload["data"]["key_register_ts"] = json!(123456);
+    let key = parse_registered_key(&payload).unwrap();
+    assert_eq!(key.bytes, KEY);
+    assert_eq!(key.version, Some(json!(7)));
+    let mut state = state();
+    let legacy = serde_json::to_value(&state).unwrap();
+    assert!(legacy.get("key_register_ts").is_none());
+    assert_eq!(
+        serde_json::from_value::<Credentials>(legacy)
+            .unwrap()
+            .key_register_ts,
+        None
+    );
+    state.key_register_ts = key.registered_at;
+    let encoded = reader_profile::chapter_query(&state, "123", "456", 0).unwrap();
+    assert!(url::form_urlencoded::parse(encoded.as_bytes())
+        .any(|(k, v)| k == "key_register_ts" && v == "123456"));
+    for invalid in [json!(-1), json!(i64::MAX), json!("invalid")] {
+        payload["data"]["key_register_ts"] = invalid;
+        assert!(matches!(
+            parse_registered_key(&payload),
+            Err(Fault::InvalidResponse)
+        ));
+    }
 }
 
 #[test]
@@ -327,16 +363,31 @@ fn strict_ids_and_single_chapter_query() {
         assert!(valid_id(bad).is_err());
     }
     assert!(valid_id("18446744073709551615").is_ok());
-    let q = query(&device(), &[("item_ids", "456"), ("book_id", "123")]);
+    let q = reader_profile::chapter_query(&state(), "123", "456", 123456).unwrap();
     let pairs: Vec<_> = url::form_urlencoded::parse(q.as_bytes()).collect();
     assert_eq!(pairs.iter().filter(|(k, _)| k == "item_ids").count(), 1);
     assert!(pairs.iter().any(|(k, v)| k == "item_ids" && v == "456"));
     assert!(pairs
         .iter()
+        .any(|(k, v)| k == "key_register_ts" && v == "0"));
+    assert!(pairs
+        .iter()
         .any(|(k, v)| k == "device_id" && v == "123456789"));
     assert!(pairs
         .iter()
-        .any(|(k, v)| k == "version_name" && v == "7.0.1.32"));
+        .any(|(k, v)| k == "version_name" && v == "7.4.5.32"));
+    assert!(pairs.iter().any(|(k, v)| k == "_rticket" && v == "123456"));
+    assert!(pairs
+        .iter()
+        .any(|(k, v)| k == "cdid" && v == "aabbccdd-1234-4321-8901-aabbccddeeff"));
+    let key_query = reader_profile::key_query(&device()).unwrap();
+    let key_pairs: Vec<_> = url::form_urlencoded::parse(key_query.as_bytes()).collect();
+    assert!(key_pairs
+        .iter()
+        .any(|(k, v)| k == "version_code" && v == "74532"));
+    assert!(key_pairs
+        .iter()
+        .any(|(k, v)| k == "cdid" && v == "aabbccdd-1234-4321-8901-aabbccddeeff"));
     let dir = tempfile::tempdir().unwrap();
     assert!(chapter(dir.path(), "bad", "456").is_err());
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
@@ -346,6 +397,8 @@ struct Fake {
     devices: usize,
     keys: usize,
     fetches: usize,
+    paced: bool,
+    key_fault: Option<Fault>,
     answers: VecDeque<AppResult<String>>,
 }
 impl Fake {
@@ -354,18 +407,30 @@ impl Fake {
             devices: 0,
             keys: 0,
             fetches: 0,
+            paced: false,
+            key_fault: None,
             answers: answers.into(),
         }
     }
 }
 impl Gateway for Fake {
+    fn pace(&self) -> bool {
+        self.paced
+    }
     fn register_device(&mut self) -> AppResult<Device> {
         self.devices += 1;
         Ok(device())
     }
-    fn register_key(&mut self, _: &Device) -> AppResult<(Vec<u8>, Option<Value>)> {
+    fn register_key(&mut self, _: &Device) -> AppResult<RegisteredKey> {
         self.keys += 1;
-        Ok((KEY.to_vec(), Some(json!(1))))
+        if let Some(fault) = self.key_fault {
+            return Err(fault);
+        }
+        Ok(RegisteredKey {
+            bytes: KEY.to_vec(),
+            version: Some(json!(1)),
+            registered_at: Some(123456),
+        })
     }
     fn fetch(&mut self, _: &Credentials, book: &str, chapter: &str) -> AppResult<String> {
         assert_eq!((book, chapter), ("123", "456"));
@@ -374,6 +439,82 @@ impl Gateway for Fake {
             .pop_front()
             .expect("unexpected extra chapter request")
     }
+}
+
+#[test]
+fn chapter_key_registration_respects_and_updates_the_shared_cooldown() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut saved = state();
+    saved.key = None;
+    saved.key_version = None;
+    saved.next_request_ms = now_ms().saturating_add(2 * RATE_COOLDOWN_MS);
+    save_cache(dir.path(), &saved).unwrap();
+
+    let mut gateway = Fake::new(vec![]);
+    gateway.paced = true;
+    gateway.key_fault = Some(Fault::RateLimited);
+    assert!(is_rate_limited(
+        &read_one(dir.path(), &mut gateway, "123", "456").unwrap_err()
+    ));
+    assert_eq!((gateway.devices, gateway.keys, gateway.fetches), (0, 0, 0));
+    assert_eq!(
+        load_cache(dir.path()).unwrap().unwrap().next_request_ms,
+        saved.next_request_ms
+    );
+
+    saved.next_request_ms = 0;
+    save_cache(dir.path(), &saved).unwrap();
+    let start = now_ms();
+    assert!(is_rate_limited(
+        &read_one(dir.path(), &mut gateway, "123", "456").unwrap_err()
+    ));
+    assert_eq!((gateway.devices, gateway.keys, gateway.fetches), (0, 1, 0));
+    assert!(load_cache(dir.path()).unwrap().unwrap().next_request_ms >= start + RATE_COOLDOWN_MS);
+}
+
+#[test]
+fn search_does_not_create_a_new_profile_during_legacy_cooldown() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut legacy = state();
+    legacy.device.cdid = None;
+    legacy.next_request_ms = now_ms().saturating_add(2 * RATE_COOLDOWN_MS);
+    save_cache(dir.path(), &legacy).unwrap();
+    let before = fs::read(dir.path().join(CACHE)).unwrap();
+    let err = search_report(dir.path(), "十日终焉", None).unwrap_err();
+    assert!(is_rate_limited(&err));
+    assert_eq!(fs::read(dir.path().join(CACHE)).unwrap(), before);
+    assert!(!dir.path().join(reader_profile::CACHE_DIR).exists());
+}
+
+#[test]
+fn empty_chapter_retries_once_without_renewing_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let credentials = state();
+    save_cache(dir.path(), &credentials).unwrap();
+
+    let mut recovered = Fake::new(vec![Err(Fault::EmptyResponse), Ok("body".into())]);
+    assert_eq!(
+        read_one(dir.path(), &mut recovered, "123", "456").unwrap(),
+        "body"
+    );
+    assert_eq!(
+        (recovered.devices, recovered.keys, recovered.fetches),
+        (0, 0, 2)
+    );
+
+    let mut empty = Fake::new(vec![Err(Fault::EmptyResponse), Err(Fault::EmptyResponse)]);
+    let error = read_one(dir.path(), &mut empty, "123", "456").unwrap_err();
+    assert!(error.to_string().contains("两次返回空响应"));
+    assert_eq!((empty.devices, empty.keys, empty.fetches), (0, 0, 2));
+
+    let mut limited = Fake::new(vec![Err(Fault::EmptyResponse), Err(Fault::RateLimited)]);
+    let error = read_one(dir.path(), &mut limited, "123", "456").unwrap_err();
+    assert!(error.to_string().contains("请求受限"));
+    assert_eq!((limited.devices, limited.keys, limited.fetches), (0, 0, 2));
+
+    let cached = load_cache(dir.path()).unwrap().unwrap();
+    assert_eq!(cached.device.device_id, credentials.device.device_id);
+    assert_eq!(cached.key, credentials.key);
 }
 
 #[test]
@@ -428,6 +569,10 @@ fn refresh_key_once_and_reuse_private_cache() {
         "body"
     );
     assert_eq!((fake.devices, fake.keys, fake.fetches), (1, 1, 2));
+    assert_eq!(
+        load_cache(dir.path()).unwrap().unwrap().key_register_ts,
+        Some(123456)
+    );
     let mut fake = Fake::new(vec![Err(Fault::KeyExpired), Err(Fault::KeyExpired)]);
     assert!(read_one(dir.path(), &mut fake, "123", "456").is_err());
     assert_eq!((fake.devices, fake.keys, fake.fetches), (0, 1, 2));

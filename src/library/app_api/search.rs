@@ -1,7 +1,8 @@
 //! Signed, bounded novel-only search; no lite-search or local-index fallback.
 use super::{
-    check_status, element_text, load_cache, now_ms, query, save_cache, valid_id, AppGateway,
-    AppResult, Client, Credentials, Device, DeviceLock, Fault, Gateway, BASE,
+    check_status, element_text, load_cache, now_ms, reader_profile, save_cache, valid_id,
+    with_app_gateway, AppGateway, AppResult, Credentials, Device, Fault, Gateway, RATE_COOLDOWN_MS,
+    REQUEST_INTERVAL_MS,
 };
 use crate::models::{Book, SearchContinuation, SearchReport};
 use anyhow::{bail, Result};
@@ -12,8 +13,6 @@ use std::{cmp::Reverse, collections::HashSet, path::Path, time::Duration};
 use crate::library::search::{normalized_title, rank_and_dedup, title_match};
 
 const MAX_PAGES: usize = 3;
-const REQUEST_INTERVAL_MS: u64 = 6_000;
-const RATE_COOLDOWN_MS: u64 = 60_000;
 
 /// Search the first official Android novel page using this reader's anonymous device.
 /// Non-novels and unrelated recommendations are excluded; no chapter key is needed.
@@ -35,15 +34,9 @@ pub(in crate::library) fn search_report(
     if crate::net::is_cancelled() {
         return Err(Fault::Cancelled.into());
     }
-    let _lock = DeviceLock::acquire(data_dir)?;
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(8))
-        .timeout(Duration::from_secs(25))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent("com.dragon.read")
-        .build()
-        .map_err(|_| Fault::Network)?;
-    search_page_with(data_dir, &mut AppGateway(client), term, continuation)
+    with_app_gateway(data_dir, |dir, gateway| {
+        search_page_with(dir, gateway, term, continuation)
+    })
 }
 
 struct Hit {
@@ -99,18 +92,8 @@ trait SearchGateway: Gateway {
 
 impl SearchGateway for AppGateway {
     fn search_page(&mut self, device: &Device, term: &str, cursor: &str) -> AppResult<SearchPage> {
-        let url = format!(
-            "{BASE}/bookapi/search/tab/v?{}",
-            query(
-                device,
-                &[
-                    ("query", term),
-                    ("passback", cursor),
-                    ("selected_items", ""),
-                    ("tab_type", "3"),
-                ],
-            )
-        );
+        let query = reader_profile::search_query(device, term, cursor, now_ms())?;
+        let url = format!("{}/bookapi/search/tab/v?{query}", reader_profile::BASE);
         let payload = self.response(self.signed(&url, None)?)?;
         parse_page(&payload)
     }
@@ -147,15 +130,10 @@ fn search_page_with<G: SearchGateway>(
         Some(_) => bail!("官方 APP 搜索设备已更改，请重新搜索"),
         None if continuation.is_some() => bail!("官方 APP 搜索设备不可用，请重新搜索"),
         None => {
-            let state = Credentials {
-                schema: 1,
-                device: gateway
-                    .register_device()
-                    .map_err(|e| anyhow::Error::new(e).context("官方 APP 搜索设备注册失败"))?,
-                key: None,
-                key_version: None,
-                next_request_ms: 0,
-            };
+            let device = gateway
+                .register_device()
+                .map_err(|e| anyhow::Error::new(e).context("官方 APP 搜索设备注册失败"))?;
+            let state = Credentials::new(device);
             save_cache(dir, &state)?;
             state
         }
